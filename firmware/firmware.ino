@@ -2,7 +2,7 @@
   esp32_i2s_ws_voice.ino
   - захват с I2S микрофона
   - отправка PCM чанков по WebSocket на ПК
-  - управление записью через Serial: "rec" / "stop"
+  - управление записью по кнопке на GPIO15
   Требует: WebSockets, ArduinoJson
 */
 
@@ -11,6 +11,7 @@
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include "driver/i2s.h"
+#include <GyverOLED.h>
 
 // ======= Настройки WiFi и WS =======
 const char* WIFI_SSID = "Home71";
@@ -24,13 +25,22 @@ WebSocketsClient webSocket;
 bool ws_connected = false;
 bool is_recording = false;
 
+// ======= OLED Display =======
+GyverOLED<SSD1306_128x64, OLED_BUFFER> oled;
+String current_display_text = "";
+unsigned long last_scroll_time = 0;
+int scroll_position = 0;
+const int scroll_delay = 150; // ms между прокруткой
+const int max_chars_per_line = 35; // примерно для шрифта по умолчанию
+const int max_lines = 8; // для 64px высоты
+
 // ======= I2S настройки (взято из твоего примера) =======
 #define I2S_MIC_CHANNEL I2S_CHANNEL_FMT_ONLY_LEFT
 #define I2S_MIC_SERIAL_CLOCK GPIO_NUM_26
 #define I2S_MIC_LEFT_RIGHT_CLOCK GPIO_NUM_32
 #define I2S_MIC_SERIAL_DATA GPIO_NUM_33
 
-// I2S конфиг — используем 16k, но читаем 32-bit и приводим к 16-bit
+// I2S конфиг
 i2s_config_t i2sMemsConfigBothChannels = {
   .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
   .sample_rate = 16000,
@@ -53,14 +63,117 @@ i2s_pin_config_t i2s_mic_pins = {
 };
 
 #define I2S_NUM      (I2S_NUM_0)
-#define I2S_READ_LEN (2048) // bytes per read (must be even)
+#define I2S_READ_LEN (2048) // bytes per read
 uint8_t i2s_read_buffer[I2S_READ_LEN];
 
-// ======= LED =======
-const int LED_PIN = 18; // инвертированный: LOW = ON, HIGH = OFF
+// ======= Управление =======
+const int LED_PIN = 18;     // инвертированный: LOW = ON, HIGH = OFF
+const int BUTTON_PIN = 15;  // кнопка для старта/стопа записи
 
 // ======= JSON / buffers =======
 const size_t JSON_BUF_SIZE = 16 * 1024; // для больших ответов
+
+// ======= OLED Display Functions =======
+void oled_init() {
+  oled.init();
+  oled.clear();
+  oled.setScale(1);
+  oled.setCursor(0, 0);
+  oled.print("ESP32 Voice Ready");
+  oled.update();
+}
+
+void oled_show_text(String text) {
+  current_display_text = text;
+  scroll_position = 0;
+  oled_update_display();
+}
+
+void oled_show_status(String status) {
+  oled.clear();
+  oled.setScale(2);
+  oled.setCursor(0, 2);
+  oled.print(status);
+  oled.update();
+  delay(2000); // Показать статус 2 секунды
+}
+
+void oled_show_led_state(bool led_on) {
+  if (led_on) {
+    // Заливаем экран белым - рисуем заполненный прямоугольник на весь экран
+    oled.clear();
+    oled.rect(0, 0, 127, 63, 1); // 1 означает заполненный
+  } else {
+    // Заливаем экран черным
+    oled.clear();
+  }
+  oled.update();
+  delay(2000); // Показать состояние 2 секунды
+}
+
+void oled_update_display() {
+  if (current_display_text.length() == 0) return;
+  
+  oled.clear();
+  oled.setScale(1);
+  
+  // Разбиваем текст на строки
+  int total_chars = current_display_text.length();
+  int chars_per_screen = max_chars_per_line * max_lines;
+  
+  if (total_chars <= chars_per_screen) {
+    // Текст помещается на один экран
+    int y = 0;
+    int start_pos = 0;
+    while (start_pos < total_chars && y < max_lines) {
+      int end_pos = start_pos + max_chars_per_line;
+      if (end_pos > total_chars) end_pos = total_chars;
+      
+      String line = current_display_text.substring(start_pos, end_pos);
+      oled.setCursor(0, y);
+      oled.print(line);
+      
+      start_pos = end_pos;
+      y++;
+    }
+  } else {
+    // Нужна прокрутка
+    int start_char = scroll_position;
+    int y = 0;
+    
+    while (y < max_lines && start_char < total_chars) {
+      int end_char = start_char + max_chars_per_line;
+      if (end_char > total_chars) end_char = total_chars;
+      
+      String line = current_display_text.substring(start_char, end_char);
+      oled.setCursor(0, y);
+      oled.print(line);
+      
+      start_char = end_char;
+      y++;
+    }
+  }
+  
+  oled.update();
+}
+
+void oled_handle_scrolling() {
+  if (current_display_text.length() == 0) return;
+  
+  int total_chars = current_display_text.length();
+  int chars_per_screen = max_chars_per_line * max_lines;
+  
+  if (total_chars > chars_per_screen) {
+    if (millis() - last_scroll_time > scroll_delay) {
+      scroll_position += max_chars_per_line;
+      if (scroll_position >= total_chars) {
+        scroll_position = 0; // Возврат к началу
+      }
+      oled_update_display();
+      last_scroll_time = millis();
+    }
+  }
+}
 
 // ======= Функции WS =======
 void wsEvent(WStype_t type, uint8_t * payload, size_t length) {
@@ -84,15 +197,16 @@ void wsEvent(WStype_t type, uint8_t * payload, size_t length) {
     if (cmd == "result") {
       JsonObject body = doc["body"];
       String transcription = body["transcription"] | "";
-      Serial.printf("[ws] Transcription: %s\n", transcription.c_str());
       // получаем llm_raw => choices[0].message и ищем tool_calls / function_call
       JsonObject llm_raw = body["llm_raw"];
       if (!llm_raw.isNull() && llm_raw.containsKey("choices")) {
         JsonArray choices = llm_raw["choices"];
         if (choices.size() > 0) {
           JsonObject message = choices[0]["message"];
+          bool has_function_call = false;
           // 1) try tool_calls
           if (message.containsKey("tool_calls")) {
+            has_function_call = true;
             JsonArray tool_calls = message["tool_calls"];
             for (JsonObject tc : tool_calls) {
               const char* fname = tc["function"]["name"] | "";
@@ -102,14 +216,17 @@ void wsEvent(WStype_t type, uint8_t * payload, size_t length) {
                 if (deserializeJson(a, argstr) == DeserializationError::Ok) {
                   const char* state = a["state"] | "";
                   if (strcmp(state, "on") == 0) {
-                    digitalWrite(LED_PIN, LOW); Serial.println("[led] ON");
+                    oled_show_led_state(true); // Белый экран
+                    Serial.println("[led] ON");
                   } else {
-                    digitalWrite(LED_PIN, HIGH); Serial.println("[led] OFF");
+                    oled_show_led_state(false); // Черный экран
+                    Serial.println("[led] OFF");
                   }
                 }
               }
             }
           } else if (message.containsKey("function_call")) {
+            has_function_call = true;
             JsonObject fc = message["function_call"];
             const char* name = fc["name"] | "";
             const char* args = fc["arguments"] | "";
@@ -118,11 +235,22 @@ void wsEvent(WStype_t type, uint8_t * payload, size_t length) {
               if (deserializeJson(a, args) == DeserializationError::Ok) {
                 const char* state = a["state"] | "";
                 if (strcmp(state, "on") == 0) {
-                  digitalWrite(LED_PIN, LOW); Serial.println("[led] ON");
+                  oled_show_led_state(true); // Белый экран
+                  Serial.println("[led] ON");
                 } else {
-                  digitalWrite(LED_PIN, HIGH); Serial.println("[led] OFF");
+                  oled_show_led_state(false); // Черный экран
+                  Serial.println("[led] OFF");
                 }
               }
+            }
+          }
+          
+          // Выводим ответ LLM только если не было вызовов функций
+          if (!has_function_call && message.containsKey("content")) {
+            String llm_response = message["content"] | "";
+            if (llm_response.length() > 0) {
+              Serial.printf("[LLM Response]: %s\n", llm_response.c_str());
+              oled_show_text(llm_response);
             }
           }
         }
@@ -167,27 +295,11 @@ void ws_send_chunk(const uint8_t* data, size_t len) {
   webSocket.sendBIN(data, len);
 }
 
-// ======= I2S helper: read raw & convert 32->16 =======
+// ======= I2S helper =======
 size_t i2s_read_and_send_chunk() {
   size_t bytes_read = 0;
   esp_err_t r = i2s_read(I2S_NUM, (void*)i2s_read_buffer, I2S_READ_LEN, &bytes_read, portMAX_DELAY);
   if (r != ESP_OK || bytes_read == 0) return 0;
-  // i2s configured as 32bit per sample -> convert to int16 (take high 16 bits)
-  // bytes_read is multiple of 4 (32-bit samples). We'll produce bytes_read/2 bytes (16-bit samples).
-  // const int32_t* in32 = (const int32_t*)i2s_read_buffer;
-  // size_t samples32 = bytes_read / 4;
-  // // prepare out buffer (static to avoid stack issues)
-  // static uint8_t outbuf[I2S_READ_LEN]; // safe: out size <= in size
-  // size_t out_idx = 0;
-  // for (size_t i = 0; i < samples32; ++i) {
-  //   int32_t s32 = in32[i];
-  //   int16_t s16 = (int16_t)(s32 >> 16); // take top 16 bits
-  //   outbuf[out_idx++] = (uint8_t)(s16 & 0xFF);
-  //   outbuf[out_idx++] = (uint8_t)((s16 >> 8) & 0xFF);
-  // }
-  // // отправляем outbuf длиной out_idx
-  // ws_send_chunk(outbuf, out_idx);
-  // return out_idx;
 
   ws_send_chunk(i2s_read_buffer, bytes_read);
   return bytes_read;
@@ -195,14 +307,11 @@ size_t i2s_read_and_send_chunk() {
 
 // ======= Recording task: блокирующий отправщик =======
 void start_i2s() {
-  // init i2s
   i2s_driver_install(I2S_NUM, &i2sMemsConfigBothChannels, 0, NULL);
   i2s_set_pin(I2S_NUM, &i2s_mic_pins);
-  // enable built-in ADC? Not needed for I2S MEMS
 }
 
 void stop_i2s() {
-  // stop and uninstall
   i2s_driver_uninstall(I2S_NUM);
 }
 
@@ -210,11 +319,19 @@ void stop_i2s() {
 void setup() {
   Serial.begin(115200);
   delay(500);
+  
+  // Инициализация OLED дисплея
+  oled_init();
+  
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH); // выключен (инверсия)
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP); // Настраиваем кнопку как вход с подтяжкой
+  
   Serial.println("ESP32 voice -> WS client");
 
   // WiFi
+  oled_show_status("WiFi...");
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PSWD);
   Serial.print("WiFi connecting");
@@ -226,57 +343,57 @@ void setup() {
   Serial.print("IP: "); Serial.println(WiFi.localIP());
 
   // websocket
+  oled_show_status("WS Connect");
   ws_setup();
-  // prepare i2s (will be installed on start)
-  // note: we will install i2s when start recording
-  Serial.println("Type 'rec' to start, 'stop' to finish recording.");
+  
+  oled_show_text("Hold button to record");
+  Serial.println("Hold the button to start recording.");
 }
 
 void loop() {
   webSocket.loop();
+  
+  // Обработка прокрутки текста на OLED
+  oled_handle_scrolling();
 
-  // Serial commands
-  if (Serial.available()) {
-    String cmd = Serial.readStringUntil('\n');
-    cmd.trim();
-    if (cmd == "rec") {
-      if (!ws_connected) {
-        Serial.println("WS not connected yet");
-        return;
-      }
-      if (is_recording) {
-        Serial.println("Already recording");
-        return;
-      }
-      // start i2s driver & send start
-      start_i2s();
-      delay(50);
-      ws_send_start(16000, 1, 2);
-      is_recording = true;
-      Serial.println("Recording started. Type 'stop' to finish.");
-    } else if (cmd == "stop") {
-      if (!is_recording) {
-        Serial.println("Not recording");
-        return;
-      }
-      // stop sending chunks and send end
-      is_recording = false;
-      ws_send_end();
-      stop_i2s();
-      Serial.println("Recording stopped. Waiting for server result...");
-    } else {
-      Serial.printf("Unknown cmd: %s\n", cmd.c_str());
+  // --- Управление записью по кнопке ---
+  int button_state = digitalRead(BUTTON_PIN);
+
+  // Если кнопка НАЖАТА (LOW) и запись НЕ идет
+  if (button_state == LOW && !is_recording) {
+    if (!ws_connected) {
+      Serial.println("WS not connected yet");
+      oled_show_text("WS not connected");
+      delay(100); // небольшая задержка перед повторной проверкой
+      return;
     }
+    
+    // Начинаем запись
+    start_i2s();
+    delay(50); // Даем I2S инициализироваться
+    ws_send_start(16000, 1, 2);
+    is_recording = true;
+    oled_show_text("Recording...");
+    Serial.println("Recording started...");
+  } 
+  // Если кнопка ОТПУЩЕНА (HIGH) и запись ИДЕТ
+  else if (button_state == HIGH && is_recording) {
+    // Останавливаем запись
+    is_recording = false;
+    ws_send_end();
+    stop_i2s();
+    oled_show_text("Processing...");
+    Serial.println("Recording stopped. Waiting for server result...");
   }
 
-  // If recording, read from I2S and send chunks
+  // Если запись активна, читаем и отправляем данные
   if (is_recording) {
-    // try to read and send; this will block until data available
     size_t sent = i2s_read_and_send_chunk();
-    // small yield
-    if (sent == 0) delay(1);
+    if (sent == 0) {
+      delay(1);
+    }
   } else {
-    // idle
+    // В режиме ожидания
     delay(10);
   }
 }

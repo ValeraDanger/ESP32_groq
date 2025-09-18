@@ -14,8 +14,9 @@ GROQ_API_KEY = "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"
 WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-MODEL_WHISPER = "whisper-large-v3-turbo"
+MODEL_WHISPER = "whisper-large-v3"
 MODEL_CHAT = "openai/gpt-oss-20b"
+
 
 # если нужен прокси, заполните словарь ниже
 
@@ -39,7 +40,7 @@ def call_llm_with_transcript(transcript_text):
                 "type": "function",
                 "function": {
                     "name": "set_led_state",
-                    "description": "Включает или выключает светодиод на пине 18 (ESP32).",
+                    "description": "Включает или выключает свет",
                     "parameters": {
                         "type": "object",
                         "properties": {
